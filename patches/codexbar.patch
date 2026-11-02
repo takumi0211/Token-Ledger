@@ -1,0 +1,218 @@
+--- a/Sources/CodexBarCore/Vendored/CostUsage/CostUsagePricing.swift
++++ b/Sources/CodexBarCore/Vendored/CostUsage/CostUsagePricing.swift
+@@ -660,14 +660,41 @@
+     /// distinct from ChatGPT/Codex Fast credit multipliers, which do not represent a USD charge.
+     static func codexAPIFastMultiplier(model: String) -> Double? {
+         switch self.normalizeCodexModel(model) {
+-        case "gpt-5.4", "gpt-5.4-mini", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra": 2
++        case "gpt-5.4", "gpt-5.4-mini", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
++             "gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna": 2
+         case "gpt-5.5": 2.5
+         default: nil
+         }
+     }
+ 
+     private static func codexAPIFastAllowsLongContext(model: String) -> Bool {
+-        self.normalizeCodexModel(model) == "gpt-6-astra"
++        [
++            "gpt-6-astra",
++            "gpt-6.1-sol",
++            "gpt-6-sol",
++            "gpt-6-luna",
++            "gpt-5.6-sol",
++            "gpt-5.6-terra",
++            "gpt-5.6-luna",
++        ].contains(self.normalizeCodexModel(model))
++    }
++
++    /// Apply the recorded response speed after the normal cache/context pricing path.
++    /// Source: https://platform.claude.com/docs/en/about-claude/pricing#fast-mode-pricing
++    static func claudeSpeedCostUSD(_ cost: Double?, model: String, speed: String?) -> Double? {
++        guard let cost else { return nil }
++        switch speed?.lowercased() {
++        case nil, "standard": return cost
++        case "fast":
++            switch self.normalizeClaudeModel(model) {
++            case "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8": return cost * 2
++            // Historical Opus 4.6 Fast responses used $30/$150; current responses
++            // report speed=standard when the deprecated Fast request falls back.
++            case "claude-opus-4-6": return cost * 6
++            default: return nil
++            }
++        default: return nil
++        }
+     }
+ 
+     static func codexCostUSD(
+--- a/Sources/CodexBarCore/Vendored/CostUsage/CostUsageScanner.swift
++++ b/Sources/CodexBarCore/Vendored/CostUsage/CostUsageScanner.swift
+@@ -2126,6 +2126,7 @@
+         let costNanos: Int
+         let costPriced: Bool?
+         var isIncomplete: Bool?
++        var speed: String?
+     }
+ 
+     static func loadDailyReport(
+@@ -3766,7 +3767,8 @@
+             if payload["type"] as? String == "thread_settings_applied" {
+                 let settings = payload["thread_settings"] as? [String: Any]
+                 return .threadSettingsApplied(
+-                    priority: Self.codexModelEvidence(settings?["service_tier"] as? String) == "priority")
++                    priority: ["priority", "fast"]
++                        .contains(Self.codexModelEvidence(settings?["service_tier"] as? String) ?? ""))
+             }
+             if payload["type"] as? String == "task_started" {
+                 return .taskStarted(turnID: Self.codexTurnID(from: payload))
+--- a/Sources/CodexBarCore/Vendored/CostUsage/CostUsageClaudeCache.swift
++++ b/Sources/CodexBarCore/Vendored/CostUsage/CostUsageClaudeCache.swift
+@@ -308,6 +308,7 @@
+         case costNanos = "c"
+         case costPriced = "priced"
+         case isIncomplete = "partial"
++        case speed
+     }
+ }
+ 
+@@ -315,7 +316,7 @@
+ /// through this JSON I/O boundary; its only persistence authority is `CostUsageStore`.
+ enum CostUsageClaudeCacheIO {
+     /// Compact row keys; older artifacts rebuild from their source transcripts.
+-    private static let schemaVersion = 4
++    private static let schemaVersion = 5
+ 
+     /// Decoded rows may be evicted under memory pressure; eight small persistence identities survive independently.
+     /// The scanner still validates source scope and reprices rows.
+--- a/Sources/CodexBarCore/Vendored/CostUsage/CostUsageScanner+ClaudeRowDecoding.swift
++++ b/Sources/CodexBarCore/Vendored/CostUsage/CostUsageScanner+ClaudeRowDecoding.swift
+@@ -42,6 +42,7 @@
+         self.costNanos = try values.decode(Int.self, forKey: .costNanos)
+         self.costPriced = try values.decodeIfPresent(Bool.self, forKey: .costPriced)
+         self.isIncomplete = try values.decodeIfPresent(Bool.self, forKey: .isIncomplete)
++        self.speed = try values.decodeIfPresent(String.self, forKey: .speed)
+     }
+ }
+ 
+--- a/Sources/CodexBarCore/Vendored/CostUsage/CostUsageScanner+Claude.swift
++++ b/Sources/CodexBarCore/Vendored/CostUsage/CostUsageScanner+Claude.swift
+@@ -223,7 +223,8 @@
+                         #if DEBUG
+                         if !isIncomplete { recordClaudeScanWork(.claudeCostCalculation) }
+                         #endif
+-                        let cost = isIncomplete ? nil : pricingResolver.costUSD(
++                        let speed = usage["speed"] as? String
++                        let baseCost = isIncomplete ? nil : pricingResolver.costUSD(
+                             model: model,
+                             inputTokens: input,
+                             cacheReadInputTokens: cacheRead,
+@@ -231,6 +232,7 @@
+                             cacheCreationInputTokens1h: cacheCreate1h,
+                             outputTokens: output,
+                             pricingDate: timestamp)
++                        let cost = CostUsagePricing.claudeSpeedCostUSD(baseCost, model: model, speed: speed)
+                         let costNanos = cost.flatMap { Int(exactly: ($0 * costScale).rounded()) }
+ 
+                         let messageId = message["id"] as? String
+@@ -256,7 +258,8 @@
+                             output: output,
+                             costNanos: costNanos ?? 0,
+                             costPriced: costNanos != nil,
+-                            isIncomplete: isIncomplete ? true : nil)
++                            isIncomplete: isIncomplete ? true : nil,
++                            speed: speed)
+ 
+                         // Keep the final cumulative chunk for each response.
+                         if let key = Self.claudeCanonicalRowKey(row) {
+@@ -1076,7 +1079,7 @@
+             aggregate.cacheRead.add(row.cacheRead)
+             aggregate.cacheCreate.add(row.cacheCreate)
+             let isPriced = row.costPriced ?? (row.costNanos > 0)
+-            let currentPricingCost = pricingResolver.costUSD(
++            let baseCost = pricingResolver.costUSD(
+                 model: row.model,
+                 inputTokens: row.input,
+                 cacheReadInputTokens: row.cacheRead,
+@@ -1086,6 +1089,7 @@
+                 pricingDate: row.timestampUnixMs.map {
+                     Date(timeIntervalSince1970: Double($0) / 1000)
+                 })
++            let currentPricingCost = CostUsagePricing.claudeSpeedCostUSD(baseCost, model: row.model, speed: row.speed)
+             let cost: Double? = if isPriced, row.costNanos == 0 {
+                 0
+             } else if let currentPricingCost {
+--- a/Sources/CodexBarCore/Vendored/CostUsage/CostUsageScanner+PricingRows.swift
++++ b/Sources/CodexBarCore/Vendored/CostUsage/CostUsageScanner+PricingRows.swift
+@@ -38,7 +38,7 @@
+             modelsDevCacheRoot: modelsDevCacheRoot,
+             customPricing: overlay,
+             pricingResolver: pricingResolver)
+-        else { return baseCost }
++        else { return nil }
+         return max(priorityCost, baseCost ?? priorityCost)
+     }
+ 
+--- a/Sources/CodexBarCore/Generated/CodexParserHash.generated.swift
++++ b/Sources/CodexBarCore/Generated/CodexParserHash.generated.swift
+@@ -1,5 +1,5 @@
+ // Generated by Scripts/regenerate-codex-parser-hash.sh. Do not edit by hand.
+ 
+ enum CodexParserHash {
+-    static let value = "a47b70abaf8ad86c"
++    static let value = "1ac12d133a1d27dc"
+ }
+--- a/Sources/CodexBarCLI/CLICostCommand.swift
++++ b/Sources/CodexBarCLI/CLICostCommand.swift
+@@ -808,6 +808,10 @@
+             modelName: breakdown.modelName,
+             costUSD: breakdown.costUSD,
+             totalTokens: breakdown.totalTokens,
++            standardCostUSD: breakdown.standardCostUSD,
++            priorityCostUSD: breakdown.priorityCostUSD,
++            standardTokens: breakdown.standardTokens,
++            priorityTokens: breakdown.priorityTokens,
+             incompleteRequestCount: breakdown.incompleteRequestCount)
+     }
+ 
+@@ -1113,6 +1117,10 @@
+     let modelName: String
+     let costUSD: Double?
+     let totalTokens: Int?
++    let standardCostUSD: Double?
++    let priorityCostUSD: Double?
++    let standardTokens: Int?
++    let priorityTokens: Int?
+ 
+     let incompleteRequestCount: Int?
+ 
+@@ -1120,13 +1128,30 @@
+         case modelName
+         case costUSD = "cost"
+         case totalTokens
++        case standardCostUSD
++        case priorityCostUSD
++        case standardTokens
++        case priorityTokens
+         case incompleteRequestCount
+     }
+ 
+-    init(modelName: String, costUSD: Double?, totalTokens: Int?, incompleteRequestCount: Int? = nil) {
++    init(
++        modelName: String,
++        costUSD: Double?,
++        totalTokens: Int?,
++        standardCostUSD: Double? = nil,
++        priorityCostUSD: Double? = nil,
++        standardTokens: Int? = nil,
++        priorityTokens: Int? = nil,
++        incompleteRequestCount: Int? = nil)
++    {
+         self.modelName = modelName
+         self.costUSD = costUSD
+         self.totalTokens = totalTokens
++        self.standardCostUSD = standardCostUSD
++        self.priorityCostUSD = priorityCostUSD
++        self.standardTokens = standardTokens
++        self.priorityTokens = priorityTokens
+         self.incompleteRequestCount = incompleteRequestCount.flatMap { $0 > 0 ? $0 : nil }
+     }
+ }
