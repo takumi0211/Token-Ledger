@@ -2,6 +2,13 @@
 
 A native macOS menu bar app for Claude Code and Codex usage.
 
+<p align="center">
+  <img src="docs/images/today.png" alt="Today view" width="260">
+  <img src="docs/images/month.png" alt="Month view" width="260">
+  <img src="docs/images/all.png" alt="All-time view" width="260">
+</p>
+<p align="center"><sub>Today · Month · All — sample data.</sub></p>
+
 - API-equivalent dollars for today, this month, and recorded history.
 - Model breakdowns, recorded Codex Fast subtotals, and interactive charts.
 - Claude's 5-hour and Codex's weekly quota, with reset countdowns.
